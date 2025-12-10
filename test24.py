@@ -18,9 +18,8 @@ CHARACTER_NAME = "Asha"
 
 INTRO_MESSAGE = (
     "Hey, I’m Asha 👋\n\n"
-    "I’m here to help you explore this portfolio site and answer questions "
-    "about Kanishq Reddy, his experience, skills, and projects — based only "
-    "on what’s written on this page."
+    "I’m here to help you explore this portfolio and answer questions "
+    "about Kanishq Reddy, his experience, skills, and projects."
 )
 
 STOPWORDS = {
@@ -31,10 +30,9 @@ STOPWORDS = {
     "them"
 }
 
-# URL of the live portfolio site (index.html)
-# You can change this to the raw GitHub URL if you want:
-#   https://raw.githubusercontent.com/kanishqreddy/kanishqreddy.github.io/main/index.html
-SITE_URL = os.environ.get("PORTFOLIO_URL", "https://kanishqreddy.github.io/")
+# URL of the live portfolio site (index.html) – used internally only
+DEFAULT_SITE_URL = "https://kanishqreddy.github.io/"
+SITE_URL = os.environ.get("PORTFOLIO_URL", DEFAULT_SITE_URL)
 
 
 # ---------------------------
@@ -82,23 +80,20 @@ def tokenize(text: str):
 
 
 # ---------------------------
-# Load & index remote index.html + build TF-IDF model
+# Load & index remote page + build TF-IDF model
 # ---------------------------
 
 @st.cache_resource
 def load_site_knowledge():
     debug = []
     html_text = None
-    html_source = None
 
     # 1) Try downloading from the live portfolio URL
     try:
-        debug.append(f"Trying SITE_URL={SITE_URL}")
         resp = requests.get(SITE_URL, timeout=5)
         debug.append(f"SITE_URL status={resp.status_code}")
         if resp.status_code == 200:
             html_text = resp.text
-            html_source = SITE_URL
     except Exception as e:
         debug.append(f"Error fetching SITE_URL: {e}")
 
@@ -110,20 +105,17 @@ def load_site_knowledge():
             os.path.join(base_dir, "public", "index.html"),
             os.path.join(base_dir, "static", "index.html"),
         ]:
-            debug.append(f"Try local {candidate} exists={os.path.exists(candidate)}")
             if os.path.exists(candidate):
                 try:
                     with open(candidate, "r", encoding="utf-8") as f:
                         html_text = f.read()
-                    html_source = candidate
                     break
                 except Exception as e:
                     debug.append(f"Error reading {candidate}: {e}")
 
     if html_text is None:
-        # Nothing worked – return empty skeleton + debug info
+        # Nothing worked – return empty skeleton + internal debug info
         return {
-            "source": None,
             "sections": {},
             "all_text": "",
             "idf": {},
@@ -132,7 +124,7 @@ def load_site_knowledge():
             "debug": debug,
         }
 
-    # Extract <section id="..."> blocks to keep structure
+    # Extract <section id="..."> blocks
     section_pattern = re.compile(
         r'<section\s+[^>]*id="([^"]+)"[^>]*>(.*?)</section>',
         re.DOTALL | re.IGNORECASE,
@@ -187,10 +179,9 @@ def load_site_knowledge():
 
     all_text = clean_html_text(html_text)
 
-    debug.append(f"Loaded {len(sections)} sections from {html_source}")
+    debug.append(f"Loaded {len(sections)} sections")
 
     return {
-        "source": html_source,
         "sections": sections,
         "all_text": all_text,
         "idf": idf,
@@ -277,51 +268,151 @@ def find_best_sections(question: str, top_k: int = 2):
     return [sec for _, sec in scored[:top_k]]
 
 
-def build_answer_from_sections(question: str):
+# ---------------------------
+# Section summarisation helpers
+# ---------------------------
+
+def section_kind(sec_id: str, heading: str) -> str:
+    """Classify a section into a simple kind for nicer wording."""
+    h = heading.lower()
+    if sec_id == "skills" or "skill" in h:
+        return "skills"
+    if sec_id == "projects" or "experience" in h or "projects" in h:
+        return "projects"
+    if sec_id == "education" or "education" in h:
+        return "education"
+    if sec_id == "contact" or "contact" in h:
+        return "contact"
+    if sec_id == "interactive-apps" or "apps" in h or "interactive" in h:
+        return "apps"
+    if sec_id == "about" or "about" in h:
+        return "about"
+    if sec_id == "hero":
+        return "hero"
+    return "other"
+
+
+def summarize_section_text(sec: dict, max_chars: int = 260) -> str:
+    sentences = sec.get("sentences") or [sec.get("text", "")]
+    text = " ".join(sentences[:3])
+    return textwrap.shorten(text, width=max_chars, placeholder="…")
+
+
+def build_section_answer(sec: dict, primary: bool) -> str:
+    """Generate a short, explanation-style answer for one section."""
+    sid = sec["id"]
+    heading = sec["heading"]
+    kind = section_kind(sid, heading)
+    summary = summarize_section_text(sec)
+
+    if kind == "skills":
+        prefix = (
+            "Here’s a short summary of his skills and tools:\n"
+            if primary else
+            "Also, regarding his skills:\n"
+        )
+    elif kind == "projects":
+        prefix = (
+            "Here’s a quick summary of his projects and experience:\n"
+            if primary else
+            "Also, from his projects and experience:\n"
+        )
+    elif kind == "education":
+        prefix = (
+            "Here’s a summary of his education background:\n"
+            if primary else
+            "Also, about his education:\n"
+        )
+    elif kind == "contact":
+        prefix = (
+            "Here’s how you can reach him:\n"
+            if primary else
+            "Also, for contacting him:\n"
+        )
+    elif kind == "apps":
+        prefix = (
+            "Here’s a quick overview of his interactive apps:\n"
+            if primary else
+            "Also, from the interactive apps:\n"
+        )
+    elif kind == "about":
+        prefix = (
+            "Here’s a short summary from the About section:\n"
+            if primary else
+            "Also, from the About section:\n"
+        )
+    elif kind == "hero":
+        prefix = (
+            "At a glance, this is what the page highlights:\n"
+            if primary else
+            "Also, from the top section:\n"
+        )
+    else:
+        prefix = (
+            f"Here’s a short summary from the {heading} section:\n"
+            if primary else
+            f"Also, from the {heading} section:\n"
+        )
+
+    tail = "\n\nIf you’d like more detail on this, just ask me to expand on it 🙂"
+    return prefix + summary + (tail if primary else "")
+
+
+# ---------------------------
+# Answer builders
+# ---------------------------
+
+def build_answer_from_sections(question: str) -> str:
     if not SITE["sections"]:
         return (
-            "I’m supposed to answer using the content of the portfolio website, "
-            "but I couldn’t load the index.html either from the live URL or locally. "
-            "Please check that the site is reachable at "
-            f"{SITE_URL!r} and that Render allows outbound HTTP."
+            "I’m supposed to answer using the content of this portfolio, "
+            "but I couldn’t load the page text right now."
         )
 
     best_secs = find_best_sections(question, top_k=2)
     if not best_secs:
         return (
-            "I’m designed to answer questions about this portfolio site only. "
-            "I couldn’t find anything on this page related to that question."
+            "I’m designed to answer questions about this portfolio only. "
+            "I couldn’t find anything related to that in the page content."
+        )
+
+    main = build_section_answer(best_secs[0], primary=True)
+    if len(best_secs) == 1:
+        return main
+
+    extra = build_section_answer(best_secs[1], primary=False)
+    return main + "\n\n" + extra
+
+
+def build_overview_answer() -> str:
+    """Give a high-level summary of the whole portfolio page."""
+    if not SITE["sections"]:
+        return (
+            "I’m supposed to answer using the content of this portfolio, "
+            "but I couldn’t load the page text right now."
         )
 
     parts = []
-    for sec in best_secs:
-        sentences = sec["sentences"] or [sec["text"]]
-        text = " ".join(sentences[:4])
-        text = textwrap.shorten(text, width=420, placeholder="…")
-        sid = sec["id"]
 
-        if sid == "about":
-            prefix = "From the About section: "
-        elif sid == "projects":
-            prefix = "From the Projects & Experience section: "
-        elif sid == "skills":
-            prefix = "From the Skills & Tools section: "
-        elif sid == "education":
-            prefix = "From the Education section: "
-        elif sid == "contact":
-            prefix = "From the Contact section: "
-        elif sid == "interactive-apps":
-            prefix = "From the Interactive Apps section: "
-        elif sid == "hero":
-            prefix = "From the top hero section: "
-        else:
-            prefix = f"From the {sec['heading']} section: "
+    def add_sec(sec_id, label):
+        sec = SITE["sections"].get(sec_id)
+        if not sec:
+            return
+        short = summarize_section_text(sec, max_chars=260)
+        parts.append(f"{label}: {short}")
 
-        parts.append(prefix + text)
+    add_sec("hero", "At a glance")
+    add_sec("about", "About Kanishq")
+    add_sec("projects", "Projects & experience")
+    add_sec("skills", "Skills & tools")
+    add_sec("education", "Education")
+    add_sec("contact", "How to contact")
 
-    if len(parts) == 1:
-        return parts[0]
-    return parts[0] + "\n\nAlso, " + parts[1]
+    if not parts:
+        text = textwrap.shorten(SITE["all_text"], width=480, placeholder="…")
+        return f"Here’s a quick overview of this portfolio:\n\n{text}"
+
+    return "Here’s a quick overview of this portfolio:\n\n" + "\n\n".join(parts)
 
 
 def generate_asha_reply(user_text: str) -> str:
@@ -330,19 +421,43 @@ def generate_asha_reply(user_text: str) -> str:
         return "You can ask me about Kanishq’s skills, projects, education, or how to contact him 😊"
 
     low = user_text.strip().lower()
+
+    # Small talk / meta
     if "who are you" in low or "what are you" in low or "your name" in low:
         return (
             f"I’m {CHARACTER_NAME}, a small chatbot built into this portfolio. "
-            "I answer questions using the content that’s written on this page."
+            "I answer questions using the content that’s written here."
         )
 
     if "what can you do" in low or "help me" in low:
         return (
-            "I can explain sections of this site — things like Kanishq’s background, "
-            "projects, skills, education, and contact details — all based on the page content."
+            "I can explain different parts of this site — things like Kanishq’s background, "
+            "projects, skills, education, and how to contact him — all based on the page content."
         )
 
-    # Otherwise, answer from website content using our TF-IDF model
+    # Generic “overview / everything / summary” questions
+    generic_overview_phrases = [
+        "tell everything",
+        "tell me everything",
+        "everything about",
+        "give me everything",
+        "overview",
+        "summary",
+        "summarise",
+        "summarize",
+        "what do you do",
+        "what does he do",
+        "about you",
+        "about kanishq",
+        "what is this website about",
+        "what is this site about",
+        "explain this website",
+        "describe this website",
+    ]
+    if any(phrase in low for phrase in generic_overview_phrases):
+        return build_overview_answer()
+
+    # Otherwise, answer from page content using our TF-IDF model
     return build_answer_from_sections(user_text)
 
 
@@ -358,29 +473,29 @@ if "messages" not in st.session_state:
     )
 
 st.title("🤖 Asha – Portfolio Chatbot")
-st.caption("Ask questions about this website and I’ll answer using only what’s written here.")
+st.caption("Ask questions about this portfolio and I’ll answer using only what’s written here.")
 
 # Render chat history
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# Sidebar info
-st.sidebar.header("Site status")
-if SITE["source"]:
-    st.sidebar.write(f"Loaded from: `{SITE['source']}`")
+# Sidebar info – no URLs, just a simple status
+st.sidebar.header("Status")
+if SITE["sections"]:
+    st.sidebar.write("Page content loaded ✅")
     st.sidebar.write(f"Sections indexed: {len(SITE['sections'])}")
 else:
-    st.sidebar.error("Could not load index.html from remote URL or local file.")
-    # Show debug info so you can see what went wrong on Render
-    if "debug" in SITE:
-        st.sidebar.write("Debug info:")
-        for line in SITE["debug"]:
-            st.sidebar.write(f"- {line}")
+    st.sidebar.error("Page content could not be loaded.")
+    # Internal debug (optional: comment out in production)
+    if "debug" in SITE and SITE["debug"]:
+        with st.sidebar.expander("Debug info (developer only)"):
+            for line in SITE["debug"]:
+                st.sidebar.write(f"- {line}")
 
-# Memory usage (for reassurance)
+# Memory usage (for reassurance, but no techy wording)
 proc = psutil.Process(os.getpid())
 mem_used = proc.memory_info().rss / (1024 ** 2)
-st.sidebar.write(f"Approx. memory in use: {mem_used:.1f} MB (limit ~500MB, no heavy ML libs)")
+st.sidebar.write(f"Approx. memory in use: {mem_used:.1f} MB")
 
 # User input
 user_input = st.chat_input("Ask something about this portfolio…")
