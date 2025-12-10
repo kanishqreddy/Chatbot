@@ -20,7 +20,7 @@ INTRO_MESSAGE = (
     "Hey, I’m Asha 👋\n\n"
     "I’m here to help you explore this portfolio and answer questions "
     "about Kanishq Reddy, his experience, skills, and projects — based only "
-    "on what’s here."
+    "on what’s written here."
 )
 
 STOPWORDS = {
@@ -31,7 +31,7 @@ STOPWORDS = {
     "them"
 }
 
-# URL of the live portfolio site (index.html) – used internally only
+# URL of the live portfolio site – used internally only
 DEFAULT_SITE_URL = "https://kanishqreddy.github.io/"
 SITE_URL = os.environ.get("PORTFOLIO_URL", DEFAULT_SITE_URL)
 
@@ -476,7 +476,28 @@ def build_expand_answer() -> str:
     return "\n\n".join(blocks)
 
 # ---------------------------
-# Main reply router (with greetings / thanks / bye)
+# Phrase matching helper (fixes "hi" inside "his")
+# ---------------------------
+
+def contains_any_phrase(text: str, phrases) -> bool:
+    """
+    Check if `text` contains any phrase from `phrases`.
+
+    Single-word phrases must match whole words (using word boundaries),
+    multi-word phrases can be simple substring matches.
+    """
+    for p in phrases:
+        p = p.lower()
+        if " " in p:
+            if p in text:
+                return True
+        else:
+            if re.search(r"\b" + re.escape(p) + r"\b", text):
+                return True
+    return False
+
+# ---------------------------
+# Main reply router
 # ---------------------------
 
 def generate_asha_reply(user_text: str) -> str:
@@ -490,7 +511,7 @@ def generate_asha_reply(user_text: str) -> str:
     greeting_phrases = [
         "hi", "hello", "hey", "good morning", "good afternoon", "good evening"
     ]
-    if any(p in low for p in greeting_phrases) and len(low) <= 40:
+    if contains_any_phrase(low, greeting_phrases) and len(low) <= 40:
         return (
             "Hey there 😊\n\n"
             "I’m Asha. I can tell you about his skills, projects, education, "
@@ -499,16 +520,16 @@ def generate_asha_reply(user_text: str) -> str:
 
     # Thanks
     thanks_phrases = ["thank you", "thanks", "thx", "tysm", "ty"]
-    if any(p in low for p in thanks_phrases):
+    if contains_any_phrase(low, thanks_phrases):
         return "You’re very welcome 🤍 If you want to know more about anything on this portfolio, just ask."
 
     # Farewell
     bye_phrases = ["bye", "goodbye", "see you", "see ya", "good night"]
-    if any(p in low for p in bye_phrases):
+    if contains_any_phrase(low, bye_phrases):
         return "Thanks for dropping by! If you have more questions about his work or skills, you can always come back 😊"
 
     # Small talk / meta
-    if "who are you" in low or "what are you" in low or "your name" in low:
+    if any(x in low for x in ["who are you", "what are you", "your name"]):
         return (
             f"I’m {CHARACTER_NAME}, a small chatbot built into this portfolio. "
             "I answer questions using the content that’s written here."
@@ -534,7 +555,7 @@ def generate_asha_reply(user_text: str) -> str:
         "elaborate",
         "elaborate more",
     ]
-    if any(phrase in low for phrase in expand_phrases):
+    if contains_any_phrase(low, expand_phrases):
         return build_expand_answer()
 
     # Generic “overview / everything / summary” questions
@@ -556,7 +577,7 @@ def generate_asha_reply(user_text: str) -> str:
         "explain this website",
         "describe this website",
     ]
-    if any(phrase in low for phrase in generic_overview_phrases):
+    if contains_any_phrase(low, generic_overview_phrases):
         return build_overview_answer()
 
     # Otherwise, answer from page content using our TF-IDF model
@@ -580,7 +601,7 @@ st.caption("Ask questions about this portfolio and I’ll answer using only what
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# Sidebar: simple status + live RAM stats (for you)
+# Sidebar: simple status + live RAM stats
 with st.sidebar:
     if not SITE["sections"]:
         st.error("I’m having trouble loading the page content right now.")
@@ -596,28 +617,25 @@ with st.sidebar:
     st.write(f"Approx. memory in use: **{mem_used:.1f} MB**")
 
 # ---------------------------
-# Quick suggestion buttons (only before first user message)
+# Suggestion buttons (always visible)
 # ---------------------------
 
 user_input = None  # will be set by a button or the chat box
 
-num_user_msgs = sum(1 for m in st.session_state.messages if m["role"] == "user")
+suggestions = [
+    "Give me an overview",
+    "What are his skills?",
+    "Show me his projects",
+    "Tell me about his education",
+    "How can I contact him?",
+]
 
-if num_user_msgs == 0:
-    suggestions = [
-        "Give me an overview",
-        "What are his skills?",
-        "Show me his projects",
-        "Tell me about his education",
-        "How can I contact him?",
-    ]
+st.markdown("##### Not sure what to ask? Try one of these:")
 
-    st.markdown("##### Not sure what to ask? Try one of these:")
-
-    cols = st.columns(len(suggestions))
-    for col, text in zip(cols, suggestions):
-        if col.button(text, use_container_width=True):
-            user_input = text
+cols = st.columns(len(suggestions))
+for col, text in zip(cols, suggestions):
+    if col.button(text, use_container_width=True):
+        user_input = text
 
 # If no suggestion button was clicked, fall back to the chat input
 if user_input is None:
