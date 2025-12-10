@@ -19,7 +19,8 @@ CHARACTER_NAME = "Asha"
 INTRO_MESSAGE = (
     "Hey, I’m Asha 👋\n\n"
     "I’m here to help you explore this portfolio and answer questions "
-    "about Kanishq Reddy, his experience, skills, and projects."
+    "about Kanishq Reddy, his experience, skills, and projects — based only "
+    "on what’s here."
 )
 
 STOPWORDS = {
@@ -33,7 +34,6 @@ STOPWORDS = {
 # URL of the live portfolio site (index.html) – used internally only
 DEFAULT_SITE_URL = "https://kanishqreddy.github.io/"
 SITE_URL = os.environ.get("PORTFOLIO_URL", DEFAULT_SITE_URL)
-
 
 # ---------------------------
 # HTML / text utilities
@@ -77,7 +77,6 @@ def tokenize(text: str):
         for w in re.findall(r"\b\w+\b", text)
         if len(w) > 2 and w.lower() not in STOPWORDS
     ]
-
 
 # ---------------------------
 # Load & index remote page + build TF-IDF model
@@ -207,7 +206,6 @@ SECTION_ALIASES = {
     "hero": {"hero", "top", "intro", "header"},
 }
 
-
 # ---------------------------
 # TF-IDF scoring utilities
 # ---------------------------
@@ -266,7 +264,6 @@ def find_best_sections(question: str, top_k: int = 2):
         return []
     scored.sort(key=lambda x: x[0], reverse=True)
     return [sec for _, sec in scored[:top_k]]
-
 
 # ---------------------------
 # Section summarisation helpers
@@ -357,7 +354,6 @@ def build_section_answer(sec: dict, primary: bool) -> str:
     tail = "\n\nIf you’d like more detail on this, just ask me to expand on it 🙂"
     return prefix + summary + (tail if primary else "")
 
-
 # ---------------------------
 # Answer builders
 # ---------------------------
@@ -376,6 +372,12 @@ def build_answer_from_sections(question: str) -> str:
             "I couldn’t find anything related to that in the page content."
         )
 
+    # Remember which sections we used, so we can expand later
+    try:
+        st.session_state["last_sections"] = [sec["id"] for sec in best_secs]
+    except Exception:
+        pass
+
     main = build_section_answer(best_secs[0], primary=True)
     if len(best_secs) == 1:
         return main
@@ -393,6 +395,7 @@ def build_overview_answer() -> str:
         )
 
     parts = []
+    order = ["hero", "about", "projects", "skills", "education", "contact"]
 
     def add_sec(sec_id, label):
         sec = SITE["sections"].get(sec_id)
@@ -408,6 +411,12 @@ def build_overview_answer() -> str:
     add_sec("education", "Education")
     add_sec("contact", "How to contact")
 
+    # Remember overview sections as context for "tell me more"
+    try:
+        st.session_state["last_sections"] = [sid for sid in order if sid in SITE["sections"]]
+    except Exception:
+        pass
+
     if not parts:
         text = textwrap.shorten(SITE["all_text"], width=480, placeholder="…")
         return f"Here’s a quick overview of this portfolio:\n\n{text}"
@@ -415,12 +424,88 @@ def build_overview_answer() -> str:
     return "Here’s a quick overview of this portfolio:\n\n" + "\n\n".join(parts)
 
 
+def build_expand_answer() -> str:
+    """Give more detail about the last sections Asha talked about."""
+    if not SITE["sections"]:
+        return (
+            "I’m supposed to answer using this portfolio, "
+            "but I couldn’t load the page text right now."
+        )
+
+    try:
+        sec_ids = st.session_state.get("last_sections")
+    except Exception:
+        sec_ids = None
+
+    if not sec_ids:
+        # No previous context → fall back to a general overview
+        return build_overview_answer()
+
+    blocks = []
+    for sid in sec_ids[:2]:  # expand at most two sections
+        sec = SITE["sections"].get(sid)
+        if not sec:
+            continue
+
+        heading = sec["heading"]
+        kind = section_kind(sid, heading)
+        sentences = sec.get("sentences") or [sec.get("text", "")]
+        text = " ".join(sentences[:6])
+        text = textwrap.shorten(text, width=520, placeholder="…")
+
+        if kind == "skills":
+            label = "Here’s more detail on his skills:"
+        elif kind == "projects":
+            label = "Here’s more detail on his projects and experience:"
+        elif kind == "education":
+            label = "Here’s more detail on his education:"
+        elif kind == "contact":
+            label = "Here’s more detail on how to contact him:"
+        elif kind == "apps":
+            label = "Here’s more detail on his interactive apps:"
+        elif kind == "about":
+            label = "Here’s more detail from the About section:"
+        else:
+            label = f"Here’s more detail from {heading}:"
+
+        blocks.append(f"{label}\n{text}")
+
+    if not blocks:
+        return build_overview_answer()
+
+    return "\n\n".join(blocks)
+
+# ---------------------------
+# Main reply router (with greetings / thanks / bye)
+# ---------------------------
+
 def generate_asha_reply(user_text: str) -> str:
     """Top-level reply generator using our TF-IDF retrieval model."""
     if not user_text or not user_text.strip():
         return "You can ask me about Kanishq’s skills, projects, education, or how to contact him 😊"
 
     low = user_text.strip().lower()
+
+    # Greetings
+    greeting_phrases = [
+        "hi", "hello", "hey", "good morning", "good afternoon", "good evening"
+    ]
+    if any(p in low for p in greeting_phrases) and len(low) <= 40:
+        return (
+            "Hey there 😊\n\n"
+            "I’m Asha. I can tell you about his skills, projects, education, "
+            "or how to contact him. What would you like to know first?"
+        )
+
+    # Thanks
+    thanks_phrases = ["thank you", "thanks", "thx", "tysm", "ty"]
+    if any(p in low for p in thanks_phrases):
+        return "You’re very welcome 🤍 If you want to know more about anything on this portfolio, just ask."
+
+    # Farewell
+    bye_phrases = ["bye", "goodbye", "see you", "see ya", "good night"]
+    if any(p in low for p in bye_phrases):
+        return "Thanks for dropping by! If you have more questions about his work or skills, you can always come back 😊"
 
     # Small talk / meta
     if "who are you" in low or "what are you" in low or "your name" in low:
@@ -434,6 +519,23 @@ def generate_asha_reply(user_text: str) -> str:
             "I can explain different parts of this site — things like Kanishq’s background, "
             "projects, skills, education, and how to contact him — all based on the page content."
         )
+
+    # Follow-up: "tell me more", "go deeper", etc.
+    expand_phrases = [
+        "tell me more",
+        "can you explain more",
+        "explain more",
+        "more details",
+        "give me more details",
+        "more detail",
+        "expand this",
+        "expand on that",
+        "go deeper",
+        "elaborate",
+        "elaborate more",
+    ]
+    if any(phrase in low for phrase in expand_phrases):
+        return build_expand_answer()
 
     # Generic “overview / everything / summary” questions
     generic_overview_phrases = [
@@ -460,7 +562,6 @@ def generate_asha_reply(user_text: str) -> str:
     # Otherwise, answer from page content using our TF-IDF model
     return build_answer_from_sections(user_text)
 
-
 # ---------------------------
 # Session state & UI
 # ---------------------------
@@ -479,26 +580,52 @@ st.caption("Ask questions about this portfolio and I’ll answer using only what
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# Sidebar info – no URLs, just a simple status
-st.sidebar.header("Status")
-if SITE["sections"]:
-    st.sidebar.write("Page content loaded ✅")
-    st.sidebar.write(f"Sections indexed: {len(SITE['sections'])}")
-else:
-    st.sidebar.error("Page content could not be loaded.")
-    # Internal debug (optional: comment out in production)
-    if "debug" in SITE and SITE["debug"]:
-        with st.sidebar.expander("Debug info (developer only)"):
-            for line in SITE["debug"]:
-                st.sidebar.write(f"- {line}")
+# Sidebar: simple status + live RAM stats (for you)
+with st.sidebar:
+    if not SITE["sections"]:
+        st.error("I’m having trouble loading the page content right now.")
+        if SITE.get("debug"):
+            with st.expander("Debug info (developer only)"):
+                for line in SITE["debug"]:
+                    st.write(f"- {line}")
+    else:
+        st.markdown("**Asha is online and ready to chat.**")
 
-# Memory usage (for reassurance, but no techy wording)
-proc = psutil.Process(os.getpid())
-mem_used = proc.memory_info().rss / (1024 ** 2)
-st.sidebar.write(f"Approx. memory in use: {mem_used:.1f} MB")
+    proc = psutil.Process(os.getpid())
+    mem_used = proc.memory_info().rss / (1024 ** 2)
+    st.write(f"Approx. memory in use: **{mem_used:.1f} MB**")
 
-# User input
-user_input = st.chat_input("Ask something about this portfolio…")
+# ---------------------------
+# Quick suggestion buttons (only before first user message)
+# ---------------------------
+
+user_input = None  # will be set by a button or the chat box
+
+num_user_msgs = sum(1 for m in st.session_state.messages if m["role"] == "user")
+
+if num_user_msgs == 0:
+    suggestions = [
+        "Give me an overview",
+        "What are his skills?",
+        "Show me his projects",
+        "Tell me about his education",
+        "How can I contact him?",
+    ]
+
+    st.markdown("##### Not sure what to ask? Try one of these:")
+
+    cols = st.columns(len(suggestions))
+    for col, text in zip(cols, suggestions):
+        if col.button(text, use_container_width=True):
+            user_input = text
+
+# If no suggestion button was clicked, fall back to the chat input
+if user_input is None:
+    user_input = st.chat_input("Ask something about this portfolio…")
+
+# ---------------------------
+# Handle user input (typed or clicked)
+# ---------------------------
 
 if user_input:
     # Add user message
