@@ -2,9 +2,11 @@ import re
 import os
 import textwrap
 import math
-from collections import Counter, defaultdict
+from collections import Counter
+
 import streamlit as st
 import psutil
+import requests
 
 # ---------------------------
 # Basic config
@@ -15,9 +17,10 @@ st.set_page_config(page_title="Asha – Portfolio Chatbot", layout="centered")
 CHARACTER_NAME = "Asha"
 
 INTRO_MESSAGE = (
-    "Hey, I’m a bot 👋\n\n"
+    "Hey, I’m Asha 👋\n\n"
     "I’m here to help you explore this portfolio site and answer questions "
-    "about Kanishq Reddy, his experience, skills, and projects"
+    "about Kanishq Reddy, his experience, skills, and projects — based only "
+    "on what’s written on this page."
 )
 
 STOPWORDS = {
@@ -28,6 +31,12 @@ STOPWORDS = {
     "them"
 }
 
+# URL of the live portfolio site (index.html)
+# You can change this to the raw GitHub URL if you want:
+#   https://raw.githubusercontent.com/kanishqreddy/kanishqreddy.github.io/main/index.html
+SITE_URL = os.environ.get("PORTFOLIO_URL", "https://kanishqreddy.github.io/")
+
+
 # ---------------------------
 # HTML / text utilities
 # ---------------------------
@@ -36,7 +45,6 @@ def clean_html_text(html: str) -> str:
     """Strip tags and script/style from HTML and normalise whitespace."""
     if not html:
         return ""
-    # comments, scripts, styles
     html = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
     html = re.sub(
         r"<script[^>]*>.*?</script>",
@@ -50,9 +58,7 @@ def clean_html_text(html: str) -> str:
         html,
         flags=re.DOTALL | re.IGNORECASE,
     )
-    # tags
-    html = re.sub(r"<[^>]+>", " ", html)
-    # entities + whitespace
+    html = re.sub(r"<[^>]+>", " ", html)  # strip remaining tags
     html = re.sub(r"&nbsp;?", " ", html, flags=re.IGNORECASE)
     html = re.sub(r"\s+", " ", html)
     return html.strip()
@@ -67,7 +73,7 @@ def split_sentences(text: str):
 
 
 def tokenize(text: str):
-    """Lowercase word tokens, minus stopwords / short tokens."""
+    """Lowercase word tokens, minus stopwords / very short tokens."""
     return [
         w.lower()
         for w in re.findall(r"\b\w+\b", text)
@@ -76,38 +82,54 @@ def tokenize(text: str):
 
 
 # ---------------------------
-# Load & index index.html + build TF-IDF model
+# Load & index remote index.html + build TF-IDF model
 # ---------------------------
 
 @st.cache_resource
 def load_site_knowledge():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(base_dir, "index.html"),
-        os.path.join(base_dir, "public", "index.html"),
-        os.path.join(base_dir, "static", "index.html"),
-    ]
-
+    debug = []
     html_text = None
-    html_path = None
-    for path in candidates:
-        if os.path.exists(path):
-            html_path = path
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    html_text = f.read()
-                break
-            except Exception:
-                continue
+    html_source = None
+
+    # 1) Try downloading from the live portfolio URL
+    try:
+        debug.append(f"Trying SITE_URL={SITE_URL}")
+        resp = requests.get(SITE_URL, timeout=5)
+        debug.append(f"SITE_URL status={resp.status_code}")
+        if resp.status_code == 200:
+            html_text = resp.text
+            html_source = SITE_URL
+    except Exception as e:
+        debug.append(f"Error fetching SITE_URL: {e}")
+
+    # 2) Fallback: try a local index.html (for local dev)
+    if html_text is None:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        for candidate in [
+            os.path.join(base_dir, "index.html"),
+            os.path.join(base_dir, "public", "index.html"),
+            os.path.join(base_dir, "static", "index.html"),
+        ]:
+            debug.append(f"Try local {candidate} exists={os.path.exists(candidate)}")
+            if os.path.exists(candidate):
+                try:
+                    with open(candidate, "r", encoding="utf-8") as f:
+                        html_text = f.read()
+                    html_source = candidate
+                    break
+                except Exception as e:
+                    debug.append(f"Error reading {candidate}: {e}")
 
     if html_text is None:
+        # Nothing worked – return empty skeleton + debug info
         return {
-            "path": None,
+            "source": None,
             "sections": {},
             "all_text": "",
             "idf": {},
             "doc_vecs": {},
             "doc_norms": {},
+            "debug": debug,
         }
 
     # Extract <section id="..."> blocks to keep structure
@@ -142,15 +164,14 @@ def load_site_knowledge():
     for sec_id, sec in sections.items():
         tokens = tokenize(sec["text"])
         docs_tokens[sec_id] = tokens
-        unique_terms = set(tokens)
-        for t in unique_terms:
+        for t in set(tokens):
             df[t] += 1
 
     N = max(len(sections), 1)
-    idf = {}
-    for term, freq in df.items():
-        # classic IDF with smoothing
-        idf[term] = math.log((1 + N) / (1 + freq)) + 1.0
+    idf = {
+        term: math.log((1 + N) / (1 + freq)) + 1.0
+        for term, freq in df.items()
+    }
 
     doc_vecs = {}
     doc_norms = {}
@@ -166,13 +187,16 @@ def load_site_knowledge():
 
     all_text = clean_html_text(html_text)
 
+    debug.append(f"Loaded {len(sections)} sections from {html_source}")
+
     return {
-        "path": html_path,
+        "source": html_source,
         "sections": sections,
         "all_text": all_text,
         "idf": idf,
         "doc_vecs": doc_vecs,
         "doc_norms": doc_norms,
+        "debug": debug,
     }
 
 
@@ -230,11 +254,12 @@ def score_section(question: str, sec_id: str, sec: dict) -> float:
     norm_d = SITE["doc_norms"].get(sec_id, 1.0)
     base = cosine_sim(vec_q, norm_q, vec_d, norm_d)
 
-    # small alias boost (e.g., word "projects" used when asking)
+    # alias boost: e.g. user says "projects" and this is the projects section
     q_tokens = set(tokenize(question))
     aliases = SECTION_ALIASES.get(sec_id, set())
     if q_tokens & aliases:
         base += 0.2
+
     return base
 
 
@@ -255,9 +280,10 @@ def find_best_sections(question: str, top_k: int = 2):
 def build_answer_from_sections(question: str):
     if not SITE["sections"]:
         return (
-            "I’m supposed to answer using the content of this website, "
-            "but I couldn’t load the page on the server. "
-            "You might want to refresh or contact the site owner."
+            "I’m supposed to answer using the content of the portfolio website, "
+            "but I couldn’t load the index.html either from the live URL or locally. "
+            "Please check that the site is reachable at "
+            f"{SITE_URL!r} and that Render allows outbound HTTP."
         )
 
     best_secs = find_best_sections(question, top_k=2)
@@ -340,11 +366,16 @@ for msg in st.session_state.messages:
 
 # Sidebar info
 st.sidebar.header("Site status")
-if SITE["path"]:
-    st.sidebar.write(f"Page loaded from: `{os.path.basename(SITE['path'])}`")
+if SITE["source"]:
+    st.sidebar.write(f"Loaded from: `{SITE['source']}`")
     st.sidebar.write(f"Sections indexed: {len(SITE['sections'])}")
 else:
-    st.sidebar.error("index.html could not be found on the server.")
+    st.sidebar.error("Could not load index.html from remote URL or local file.")
+    # Show debug info so you can see what went wrong on Render
+    if "debug" in SITE:
+        st.sidebar.write("Debug info:")
+        for line in SITE["debug"]:
+            st.sidebar.write(f"- {line}")
 
 # Memory usage (for reassurance)
 proc = psutil.Process(os.getpid())
@@ -369,5 +400,3 @@ if user_input:
     # Trim long histories just in case
     if len(st.session_state.messages) > 40:
         st.session_state.messages = st.session_state.messages[-40:]
-
-
