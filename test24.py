@@ -16,10 +16,9 @@ st.set_page_config(page_title="Asha – Portfolio Chatbot", layout="centered")
 CHARACTER_NAME = "Asha"
 
 INTRO_MESSAGE = (
-    "Hey, I’m Asha 👋\n\n"
+    "Hey, I’m a bot 👋\n\n"
     "I’m here to help you explore this portfolio site and answer questions "
-    "about Kanishq Reddy, his experience, skills, and projects — based only "
-    "on what’s written on this page."
+    "about Kanishq Reddy, his experience, skills, and projects"
 )
 
 STOPWORDS = {
@@ -371,3 +370,4 @@ if user_input:
     # Trim long histories just in case
     if len(st.session_state.messages) > 40:
         st.session_state.messages = st.session_state.messages[-40:]
+
