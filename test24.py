@@ -1,43 +1,143 @@
 import re
 import os
+import textwrap
+
+import streamlit as st
 import psutil
 import torch
-import streamlit as st
-from transformers import BlenderbotSmallTokenizer, BlenderbotSmallForConditionalGeneration
+from transformers import AutoTokenizer, AutoModel
+
 
 # ---------------------------
-# Streamlit config
+# Basic config
 # ---------------------------
-st.set_page_config(page_title="Asha – Website Guide", layout="centered")
 
-# ---------------------------
-# Character / Personality
-# ---------------------------
+st.set_page_config(page_title="Asha – Portfolio Chatbot", layout="centered")
+
 CHARACTER_NAME = "Asha"
-CHARACTER_PERSONALITY = (
-    f"{CHARACTER_NAME} is a friendly, knowledgeable guide for Kanishq Reddy’s portfolio website. "
-    "She answers questions ONLY using the information that is actually on the portfolio page. "
-    "If something is not in the website, she clearly says she doesn’t know instead of guessing. "
-    "Her tone is warm, concise, and professional, like a helpful teammate walking you through the site. "
-    "She can use light emojis sometimes (😊, 📊, 💻) but keeps the focus on clarity."
+
+INTRO_MESSAGE = (
+    "Hey, I’m Asha 👋\n\n"
+    "I’m here to help you explore this portfolio site and answer questions "
+    "about Kanishq Reddy, his experience, skills, and projects — based only "
+    "on what’s written on this page."
 )
 
+STOPWORDS = {
+    "the", "and", "a", "an", "of", "to", "in", "on", "for", "with",
+    "is", "are", "was", "were", "it", "this", "that", "as", "at",
+    "by", "from", "or", "be", "about", "my", "i", "you", "your",
+    "me", "we", "our", "they", "their", "he", "she", "his", "her",
+    "them"
+}
+
+# Tiny encoder model (very small)
+MODEL_NAME = "prajjwal1/bert-tiny"
+DEVICE = torch.device("cpu")
+
+
 # ---------------------------
-# Load and index website content
+# HTML / text utilities
 # ---------------------------
 
-STOPWORDS = {
-    "the","and","a","an","of","to","in","on","for","with","is","are","was","were",
-    "it","this","that","as","at","by","from","or","be","about","my","i","you",
-    "your","me","we","our","they","their","he","she","his","her","them"
-}
+def clean_html_text(html: str) -> str:
+    """Strip tags and script/style from HTML and normalise whitespace."""
+    if not html:
+        return ""
+    # comments, scripts, styles
+    html = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
+    html = re.sub(
+        r"<script[^>]*>.*?</script>",
+        " ",
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    html = re.sub(
+        r"<style[^>]*>.*?</style>",
+        " ",
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    # tags
+    html = re.sub(r"<[^>]+>", " ", html)
+    # entities + whitespace
+    html = re.sub(r"&nbsp;?", " ", html, flags=re.IGNORECASE)
+    html = re.sub(r"\s+", " ", html)
+    return html.strip()
+
+
+def split_sentences(text: str):
+    """Very small sentence splitter."""
+    if not text:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def extract_keywords(text: str):
+    words = re.findall(r"\b\w+\b", text.lower())
+    return {w for w in words if len(w) > 2 and w not in STOPWORDS}
+
+
+# ---------------------------
+# Load model (tiny encoder)
+# ---------------------------
+
+@st.cache_resource
+def load_model():
+    """
+    Load a very small transformer encoder (bert-tiny) to stay under
+    the 500MB RAM limit. This is used for semantic similarity only,
+    not for text generation.
+    """
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        model = AutoModel.from_pretrained(MODEL_NAME)
+        model.to(DEVICE)
+        model.eval()
+        return tokenizer, model
+    except Exception as e:
+        # If anything goes wrong, fall back to no-model mode
+        st.sidebar.error(f"Could not load model ({MODEL_NAME}): {e}")
+        return None, None
+
+
+def encode_text(text: str, tokenizer, model):
+    """Get a single vector embedding for a piece of text using mean pooling."""
+    if not text:
+        return None
+    encoded = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=128,
+    )
+    encoded = {k: v.to(DEVICE) for k, v in encoded.items()}
+    with torch.no_grad():
+        out = model(**encoded)
+    token_emb = out.last_hidden_state  # (1, L, H)
+    mask = encoded["attention_mask"].unsqueeze(-1)  # (1, L, 1)
+    masked = token_emb * mask
+    summed = masked.sum(dim=1)          # (1, H)
+    counts = mask.sum(dim=1).clamp(min=1)  # (1, 1)
+    mean = summed / counts
+    return mean[0].cpu()  # (H,)
+
+
+def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+    if a is None or b is None:
+        return 0.0
+    a_norm = a / (a.norm() + 1e-8)
+    b_norm = b / (b.norm() + 1e-8)
+    return float((a_norm * b_norm).sum().item())
+
+
+# ---------------------------
+# Load & index index.html
+# ---------------------------
 
 @st.cache_resource
 def load_site_knowledge():
-    """Load index.html from disk and build a simple text index.
-
-    The model will only be allowed to answer using this content.
-    """  # noqa: D401
     base_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(base_dir, "index.html"),
@@ -58,319 +158,247 @@ def load_site_knowledge():
                 continue
 
     if html_text is None:
-        # Fallback: no file found – return empty index
         return {
             "path": None,
-            "sentences": [],
-            "indexed": [],
-            "raw": ""
+            "sections": {},
+            "all_text": "",
         }
 
-    # Remove comments, scripts, styles
-    cleaned = re.sub(r"<!--.*?-->", " ", html_text, flags=re.DOTALL)
-    cleaned = re.sub(
-        r"<script[^>]*>.*?</script>",
-        " ",
-        cleaned,
-        flags=re.DOTALL | re.IGNORECASE,
+    # Extract <section id="..."> blocks to keep structure
+    section_pattern = re.compile(
+        r'<section\s+[^>]*id="([^"]+)"[^>]*>(.*?)</section>',
+        re.DOTALL | re.IGNORECASE,
     )
-    cleaned = re.sub(
-        r"<style[^>]*>.*?</style>",
-        " ",
-        cleaned,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    # Strip tags
-    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
-    cleaned = re.sub(r"&nbsp;?", " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-
-    # Split into sentence-ish chunks
-    parts = re.split(r"(?<=[.!?])\s+", cleaned)
-    sentences = [p.strip() for p in parts if len(p.strip()) > 25]
-
-    indexed = []
-    for s in sentences:
-        words = set(w.lower() for w in re.findall(r"\b\w+\b", s))
-        indexed.append(
-            {
-                "text": s,
-                "words": words,
-            }
+    sections = {}
+    for sec_id, sec_html in section_pattern.findall(html_text):
+        clean_text = clean_html_text(sec_html)
+        sentences = split_sentences(clean_text)
+        heading_match = re.search(
+            r"<h2[^>]*>(.*?)</h2>",
+            sec_html,
+            flags=re.DOTALL | re.IGNORECASE,
         )
+        if heading_match:
+            heading = clean_html_text(heading_match.group(1))
+        else:
+            # Fallback to id as human label
+            heading = sec_id.replace("-", " ").title()
+
+        sections[sec_id] = {
+            "id": sec_id,
+            "heading": heading,
+            "text": clean_text,
+            "sentences": sentences,
+            "keywords": extract_keywords(clean_text),
+        }
+
+    all_text = clean_html_text(html_text)
 
     return {
         "path": html_path,
-        "sentences": sentences,
-        "indexed": indexed,
-        "raw": cleaned,
+        "sections": sections,
+        "all_text": all_text,
     }
 
 
-SITE_KNOWLEDGE = load_site_knowledge()
+SITE = load_site_knowledge()
+TOKENIZER, MODEL = load_model()
 
-def find_relevant_context(question: str, max_sentences: int = 8):
-    """Pick the most relevant sentences from the website for a question."""  # noqa: D401
-    if not SITE_KNOWLEDGE["indexed"]:
-        return "", 0
 
-    q_words = set(
-        w.lower()
-        for w in re.findall(r"\b\w+\b", question)
-    )
-    q_words = {w for w in q_words if w not in STOPWORDS}
+# ---------------------------
+# Retrieval-based answering with model
+# ---------------------------
 
-    if not q_words:
-        # Nothing meaningful to match – just return a short site summary
-        core = SITE_KNOWLEDGE["sentences"][:max_sentences]
-        return "\n".join(core), 0
+SECTION_ALIASES = {
+    "about": {"about", "summary", "intro", "introduction", "profile"},
+    "projects": {
+        "project", "projects", "experience", "work", "job", "internship",
+        "role", "roles",
+    },
+    "interactive-apps": {"app", "apps", "application", "dashboard", "chatbot"},
+    "skills": {"skill", "skills", "tools", "stack", "tech", "technologies"},
+    "education": {"education", "degree", "college", "university", "btech", "b.tech"},
+    "contact": {"contact", "email", "phone", "reach", "connect"},
+}
+
+
+def lexical_score(question_keywords, section):
+    """Simple overlap-based score."""
+    if not section["keywords"]:
+        return 0.0
+    overlap = question_keywords & section["keywords"]
+    return float(len(overlap))
+
+
+def score_section(question: str, section) -> float:
+    """
+    Combined lexical + semantic similarity score.
+    If the model is unavailable, fall back to lexical only.
+    """
+    q_keywords = extract_keywords(question)
+    lex = lexical_score(q_keywords, section)
+
+    # Alias boost: if question mentions a typical word for this section, bump lexical
+    for sec_id, alias_words in SECTION_ALIASES.items():
+        if section["id"] == sec_id and q_keywords & alias_words:
+            lex += 1.5
+            break
+
+    if TOKENIZER is None or MODEL is None:
+        return lex
+
+    # Semantic similarity using tiny BERT
+    section_for_model = " ".join(section["sentences"][:4]) or section["text"]
+    section_for_model = section_for_model[:512]
+
+    try:
+        q_vec = encode_text(question, TOKENIZER, MODEL)
+        s_vec = encode_text(section_for_model, TOKENIZER, MODEL)
+        sem = cosine_similarity(q_vec, s_vec)  # in [-1, 1]
+        # Map to roughly 0–2 and combine with lexical
+        sem = max(sem, 0.0) * 2.0
+    except Exception:
+        sem = 0.0
+
+    return lex * 0.7 + sem * 1.3
+
+
+def find_best_sections(question: str, top_k: int = 2):
+    if not SITE["sections"]:
+        return []
 
     scored = []
-    for item in SITE_KNOWLEDGE["indexed"]:
-        overlap = q_words & (item["words"] - STOPWORDS)
-        score = len(overlap)
-        if score > 0:
-            scored.append((score, item["text"]))
+    for sec in SITE["sections"].values():
+        s = score_section(question, sec)
+        if s > 0:
+            scored.append((s, sec))
 
     if not scored:
-        # No overlapping words – very likely out-of-scope question
-        return "", 0
+        return []
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = [text for _, text in scored[:max_sentences]]
-    best_score = scored[0][0]
-    context = "\n".join(top)
-    # Also trim extremely long context just in case
-    if len(context) > 2500:
-        context = context[:2500]
-    return context, best_score
+    return [sec for _, sec in scored[:top_k]]
+
+
+def build_answer_from_sections(question: str):
+    # If no site loaded, short message
+    if not SITE["sections"]:
+        return (
+            "I’m supposed to answer using the content of this website, "
+            "but I couldn’t load the page on the server. "
+            "You might want to refresh or contact the site owner."
+        )
+
+    best_sections = find_best_sections(question, top_k=2)
+
+    if not best_sections:
+        return (
+            "I’m designed to answer questions about this portfolio site only. "
+            "I couldn’t find anything on this page related to that question."
+        )
+
+    # Build a concise answer from 1–2 sections
+    parts = []
+    for sec in best_sections:
+        text = " ".join(sec["sentences"][:4])
+        # Limit length
+        text = textwrap.shorten(text, width=420, placeholder="…")
+        if sec["id"] == "about":
+            prefix = "From the About section: "
+        elif sec["id"] == "projects":
+            prefix = "From the Projects & Experience section: "
+        elif sec["id"] == "skills":
+            prefix = "From the Skills & Tools section: "
+        elif sec["id"] == "education":
+            prefix = "From the Education section: "
+        elif sec["id"] == "contact":
+            prefix = "From the Contact section: "
+        elif sec["id"] == "interactive-apps":
+            prefix = "From the Interactive Apps section: "
+        else:
+            prefix = f"From the {sec['heading']} section: "
+
+        parts.append(prefix + text)
+
+    if len(parts) == 1:
+        return parts[0]
+    else:
+        return parts[0] + "\n\nAlso, " + parts[1]
+
+
+def generate_asha_reply(user_text: str) -> str:
+    """Top-level reply generator using a tiny model for retrieval."""
+    if not user_text or not user_text.strip():
+        return "You can ask me about Kanishq’s skills, projects, education, or how to contact him 😊"
+
+    low = user_text.strip().lower()
+    if "who are you" in low or "what are you" in low or "your name" in low:
+        return (
+            f"I’m {CHARACTER_NAME}, a small chatbot built into this portfolio. "
+            "I answer questions using the content that’s written on this page."
+        )
+
+    if "what can you do" in low or "help me" in low:
+        return (
+            "I can explain sections of this site — things like Kanishq’s background, "
+            "projects, skills, education, and contact details — all based on the page content."
+        )
+
+    # Otherwise, answer from website content using model-powered retrieval
+    return build_answer_from_sections(user_text)
+
 
 # ---------------------------
-# Model loading (small / memory friendly)
-# ---------------------------
-
-MODEL_NAME = "facebook/blenderbot_small-90M"
-DEVICE = torch.device("cpu")  # Render free tier is CPU-only
-
-@st.cache_resource
-def load_model():
-    tokenizer = BlenderbotSmallTokenizer.from_pretrained(MODEL_NAME)
-    model = BlenderbotSmallForConditionalGeneration.from_pretrained(MODEL_NAME)
-    model.to(DEVICE)
-    model.eval()
-    return tokenizer, model
-
-tokenizer, model = load_model()
-
-# ---------------------------
-# Session state
+# Session state & UI
 # ---------------------------
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
-
-# ---------------------------
-# Helpers
-# ---------------------------
-
-def sanitize_model_output(text: str):
-    text = text.strip()
-
-    # Strip speaker labels
-    for p in [r"Asha:\s*", r"Assistant:\s*", r"Bot:\s*"]:
-        m = re.search(p, text, flags=re.IGNORECASE)
-        if m:
-            text = text[m.end():].strip()
-            break
-
-    # If the model starts writing another user turn, cut it off
-    for tag in ["\nUser:", "\nHuman:"]:
-        if tag in text:
-            text = text.split(tag)[0].strip()
-
-    # Remove bracketed directions like [laughs]
-    text = re.sub(r"\[[^\]]+\]", "", text)
-
-    # Avoid repeating the last assistant message exactly
-    last_assistant = next(
-        (m["content"] for m in reversed(st.session_state.messages)
-         if m["role"] == "assistant"),
-        ""
+    # Show intro once at the very beginning
+    st.session_state.messages.append(
+        {"role": "assistant", "content": INTRO_MESSAGE}
     )
-    if text == last_assistant:
-        return None
-
-    return re.sub(r"\s+\n", "\n", text).strip()
-
-def build_prompt(user_text: str, context: str, has_good_context: bool) -> str:
-    # Keep only last 6 messages for flavour (not for facts)
-    history = st.session_state.messages[-6:]
-    history_lines = [
-        f"{'User' if m['role']=='user' else CHARACTER_NAME}: {m['content'].strip()}"
-        for m in history
-    ]
-    history_section = "\n".join(history_lines)
-
-    scope_instruction = (
-        "You must answer ONLY using the information from the WEBSITE CONTEXT. "
-        "If the answer is not clearly supported by that context, say you don’t know "
-        "and remind the user you only know the content of the portfolio page."
-    )
-
-    if not SITE_KNOWLEDGE["indexed"]:
-        context_block = (
-            "WEBSITE CONTEXT:\n"
-            "(No website content could be loaded on the server – explain this briefly "
-            "and ask the user to contact the site owner.)"
-        )
-    elif not has_good_context:
-        # User probably asked something unrelated to the site content
-        first_sentence = SITE_KNOWLEDGE["sentences"][0] if SITE_KNOWLEDGE["sentences"] else ""
-        context_block = (
-            "WEBSITE CONTEXT:\n"
-            f"{first_sentence}\n\n"
-            "The question seems unrelated to the portfolio content."
-        )
-        scope_instruction = (
-            "The user's question does NOT match the website content. "
-            "Politely explain that you only answer questions about the portfolio "
-            "website (experience, skills, projects, contact info, education, etc.). "
-            "Do NOT hallucinate information."
-        )
-    else:
-        context_block = f"WEBSITE CONTEXT (from the portfolio page):\n{context}"
-
-    instructions = f"""ROLE:
-{CHARACTER_PERSONALITY}
-
-SCOPE:
-{scope_instruction}
-
-STYLE:
-- Speak as {CHARACTER_NAME}, a helpful guide to Kanishq Reddy's portfolio.
-- Be clear and concise (1–4 sentences per reply).
-- When referring to Kanishq, use third person ("he") unless the user speaks as Kanishq.
-- If the user asks where something is on the page, describe the section (e.g., About, Skills, Projects, Certifications, Contact).
-"""
-
-    prompt_parts = [
-        instructions,
-        context_block,
-        "RECENT CHAT:",
-        history_section,
-        "Now answer the user's latest question based ONLY on the website context.",
-        f"User: {user_text}",
-        f"{CHARACTER_NAME}:",
-    ]
-
-    prompt = "\n\n".join(p for p in prompt_parts if p)
-    # keep prompt short for memory / speed
-    return prompt[:4000]
-
-def generate_reply(user_text: str):
-    context, best_score = find_relevant_context(user_text)
-    has_good_context = best_score > 0
-
-    prompt = build_prompt(user_text, context, has_good_context)
-
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=512,
-    )
-    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-
-    gen_kwargs = dict(
-        input_ids=inputs["input_ids"],
-        attention_mask=inputs.get("attention_mask"),
-        max_new_tokens=96,
-        do_sample=True,
-        top_p=0.90,
-        temperature=0.75,
-        repetition_penalty=1.05,
-        no_repeat_ngram_size=3,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-
-    for _ in range(3):
-        try:
-            with torch.no_grad():
-                output = model.generate(**gen_kwargs)
-            decoded = tokenizer.decode(output[0], skip_special_tokens=True)
-            reply = sanitize_model_output(decoded)
-            if reply:
-                return reply
-        except Exception:
-            continue
-
-    return (
-        "I’m having a small issue reading the website content right now 😅. "
-        "Please try again in a moment, or check the portfolio directly."
-    )
-
-def maybe_trim_history(max_messages: int = 20):
-    """Trim chat history if memory usage creeps up."""  # noqa: D401
-    proc = psutil.Process(os.getpid())
-    mem_mb = proc.memory_info().rss / (1024 ** 2)
-
-    if mem_mb > 450:
-        # Keep only the last few turns
-        st.session_state.messages = st.session_state.messages[-max_messages:]
-
-
-# ---------------------------
-# UI
-# ---------------------------
 
 st.title("🤖 Asha – Portfolio Chatbot")
-st.caption("Ask me anything about this website and Kanishq Reddy’s portfolio.")
+st.caption("Ask questions about this website and I’ll answer using only what’s written here.")
 
-# Show previous messages
+# Render chat history
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# Display basic site status in sidebar
-st.sidebar.header("Site Knowledge")
-if SITE_KNOWLEDGE["path"]:
-    st.sidebar.write(f"Loaded from: `{os.path.basename(SITE_KNOWLEDGE['path'])}`")
-    st.sidebar.write(f"Indexed sentences: {len(SITE_KNOWLEDGE['sentences'])}")
+# Sidebar info
+st.sidebar.header("Site status")
+if SITE["path"]:
+    st.sidebar.write(f"Page loaded from: `{os.path.basename(SITE['path'])}`")
+    st.sidebar.write(f"Sections indexed: {len(SITE['sections'])}")
 else:
-    st.sidebar.warning(
-        "Couldn't load index.html on the server. "
-        "Asha may only be able to answer in very general terms."
-    )
+    st.sidebar.error("index.html could not be found on the server.")
 
-# Memory info (lightweight)
+if TOKENIZER is not None and MODEL is not None:
+    st.sidebar.write(f"Model: `{MODEL_NAME}` (tiny encoder for retrieval)")
+else:
+    st.sidebar.write("Model: unavailable, using lexical matching only.")
+
+# Memory usage (for reassurance)
 proc = psutil.Process(os.getpid())
 mem_used = proc.memory_info().rss / (1024 ** 2)
-st.sidebar.write(f"Memory in use: {mem_used:.2f} MB (Render free tier ≈ 500 MB)")
+st.sidebar.write(f"Approx. memory in use: {mem_used:.1f} MB (limit ~500MB)")
 
-# Input
-user_input = st.chat_input("Ask something about this portfolio website…")
-
-# ---------------------------
-# Handle User Input
-# ---------------------------
+# User input
+user_input = st.chat_input("Ask something about this portfolio…")
 
 if user_input:
+    # Add user message
     st.session_state.messages.append({"role": "user", "content": user_input})
     st.chat_message("user").write(user_input)
 
-    try:
-        reply = generate_reply(user_input)
-    except Exception as e:
-        st.error(f"Error while generating reply: {e}")
-        reply = (
-            "Something went wrong on my side 😅. "
-            "Please refresh and try asking again."
-        )
+    # Generate reply (model-assisted retrieval)
+    reply = generate_asha_reply(user_input)
 
+    # Add assistant reply
     st.session_state.messages.append({"role": "assistant", "content": reply})
     st.chat_message("assistant").write(reply)
 
-    # Update sidebar resource usage & maybe trim
-    proc = psutil.Process(os.getpid())
-    mem_used = proc.memory_info().rss / (1024 ** 2)
-    st.sidebar.write(f"Memory in use: {mem_used:.2f} MB")
-    maybe_trim_history()
+    # Optionally trim very long histories
+    if len(st.session_state.messages) > 40:
+        st.session_state.messages = st.session_state.messages[-40:]
