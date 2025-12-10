@@ -3,7 +3,6 @@ import os
 import textwrap
 import math
 from collections import Counter, defaultdict
-
 import streamlit as st
 import psutil
 
@@ -370,4 +369,5 @@ if user_input:
     # Trim long histories just in case
     if len(st.session_state.messages) > 40:
         st.session_state.messages = st.session_state.messages[-40:]
+
 
