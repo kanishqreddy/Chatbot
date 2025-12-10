@@ -1,12 +1,11 @@
 import re
 import os
 import textwrap
+import math
+from collections import Counter, defaultdict
 
 import streamlit as st
 import psutil
-import torch
-from transformers import AutoTokenizer, AutoModel
-
 
 # ---------------------------
 # Basic config
@@ -30,11 +29,6 @@ STOPWORDS = {
     "me", "we", "our", "they", "their", "he", "she", "his", "her",
     "them"
 }
-
-# Tiny encoder model (very small)
-MODEL_NAME = "prajjwal1/bert-tiny"
-DEVICE = torch.device("cpu")
-
 
 # ---------------------------
 # HTML / text utilities
@@ -74,66 +68,17 @@ def split_sentences(text: str):
     return [p.strip() for p in parts if p.strip()]
 
 
-def extract_keywords(text: str):
-    words = re.findall(r"\b\w+\b", text.lower())
-    return {w for w in words if len(w) > 2 and w not in STOPWORDS}
+def tokenize(text: str):
+    """Lowercase word tokens, minus stopwords / short tokens."""
+    return [
+        w.lower()
+        for w in re.findall(r"\b\w+\b", text)
+        if len(w) > 2 and w.lower() not in STOPWORDS
+    ]
 
 
 # ---------------------------
-# Load model (tiny encoder)
-# ---------------------------
-
-@st.cache_resource
-def load_model():
-    """
-    Load a very small transformer encoder (bert-tiny) to stay under
-    the 500MB RAM limit. This is used for semantic similarity only,
-    not for text generation.
-    """
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        model = AutoModel.from_pretrained(MODEL_NAME)
-        model.to(DEVICE)
-        model.eval()
-        return tokenizer, model
-    except Exception as e:
-        # If anything goes wrong, fall back to no-model mode
-        st.sidebar.error(f"Could not load model ({MODEL_NAME}): {e}")
-        return None, None
-
-
-def encode_text(text: str, tokenizer, model):
-    """Get a single vector embedding for a piece of text using mean pooling."""
-    if not text:
-        return None
-    encoded = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=128,
-    )
-    encoded = {k: v.to(DEVICE) for k, v in encoded.items()}
-    with torch.no_grad():
-        out = model(**encoded)
-    token_emb = out.last_hidden_state  # (1, L, H)
-    mask = encoded["attention_mask"].unsqueeze(-1)  # (1, L, 1)
-    masked = token_emb * mask
-    summed = masked.sum(dim=1)          # (1, H)
-    counts = mask.sum(dim=1).clamp(min=1)  # (1, 1)
-    mean = summed / counts
-    return mean[0].cpu()  # (H,)
-
-
-def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
-    if a is None or b is None:
-        return 0.0
-    a_norm = a / (a.norm() + 1e-8)
-    b_norm = b / (b.norm() + 1e-8)
-    return float((a_norm * b_norm).sum().item())
-
-
-# ---------------------------
-# Load & index index.html
+# Load & index index.html + build TF-IDF model
 # ---------------------------
 
 @st.cache_resource
@@ -162,6 +107,9 @@ def load_site_knowledge():
             "path": None,
             "sections": {},
             "all_text": "",
+            "idf": {},
+            "doc_vecs": {},
+            "doc_norms": {},
         }
 
     # Extract <section id="..."> blocks to keep structure
@@ -181,7 +129,6 @@ def load_site_knowledge():
         if heading_match:
             heading = clean_html_text(heading_match.group(1))
         else:
-            # Fallback to id as human label
             heading = sec_id.replace("-", " ").title()
 
         sections[sec_id] = {
@@ -189,8 +136,35 @@ def load_site_knowledge():
             "heading": heading,
             "text": clean_text,
             "sentences": sentences,
-            "keywords": extract_keywords(clean_text),
         }
+
+    # ---- Build TF-IDF model over sections ----
+    docs_tokens = {}
+    df = Counter()
+    for sec_id, sec in sections.items():
+        tokens = tokenize(sec["text"])
+        docs_tokens[sec_id] = tokens
+        unique_terms = set(tokens)
+        for t in unique_terms:
+            df[t] += 1
+
+    N = max(len(sections), 1)
+    idf = {}
+    for term, freq in df.items():
+        # classic IDF with smoothing
+        idf[term] = math.log((1 + N) / (1 + freq)) + 1.0
+
+    doc_vecs = {}
+    doc_norms = {}
+    for sec_id, tokens in docs_tokens.items():
+        tf = Counter(tokens)
+        vec = {}
+        for term, f in tf.items():
+            if term in idf:
+                vec[term] = (f / len(tokens)) * idf[term]
+        norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
+        doc_vecs[sec_id] = vec
+        doc_norms[sec_id] = norm
 
     all_text = clean_html_text(html_text)
 
@@ -198,17 +172,15 @@ def load_site_knowledge():
         "path": html_path,
         "sections": sections,
         "all_text": all_text,
+        "idf": idf,
+        "doc_vecs": doc_vecs,
+        "doc_norms": doc_norms,
     }
 
 
 SITE = load_site_knowledge()
-TOKENIZER, MODEL = load_model()
 
-
-# ---------------------------
-# Retrieval-based answering with model
-# ---------------------------
-
+# Human-friendly mapping for some section IDs
 SECTION_ALIASES = {
     "about": {"about", "summary", "intro", "introduction", "profile"},
     "projects": {
@@ -219,69 +191,70 @@ SECTION_ALIASES = {
     "skills": {"skill", "skills", "tools", "stack", "tech", "technologies"},
     "education": {"education", "degree", "college", "university", "btech", "b.tech"},
     "contact": {"contact", "email", "phone", "reach", "connect"},
+    "hero": {"hero", "top", "intro", "header"},
 }
 
 
-def lexical_score(question_keywords, section):
-    """Simple overlap-based score."""
-    if not section["keywords"]:
+# ---------------------------
+# TF-IDF scoring utilities
+# ---------------------------
+
+def build_query_vector(question: str):
+    tokens = tokenize(question)
+    if not tokens:
+        return {}, 1.0
+    tf = Counter(tokens)
+    idf = SITE["idf"]
+    vec = {}
+    for term, f in tf.items():
+        if term in idf:
+            vec[term] = (f / len(tokens)) * idf[term]
+    if not vec:
+        return {}, 1.0
+    norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
+    return vec, norm
+
+
+def cosine_sim(vec_q, norm_q, vec_d, norm_d):
+    if not vec_q or not vec_d:
         return 0.0
-    overlap = question_keywords & section["keywords"]
-    return float(len(overlap))
+    dot = 0.0
+    for term, wq in vec_q.items():
+        wd = vec_d.get(term)
+        if wd is not None:
+            dot += wq * wd
+    return dot / (norm_q * norm_d)
 
 
-def score_section(question: str, section) -> float:
-    """
-    Combined lexical + semantic similarity score.
-    If the model is unavailable, fall back to lexical only.
-    """
-    q_keywords = extract_keywords(question)
-    lex = lexical_score(q_keywords, section)
+def score_section(question: str, sec_id: str, sec: dict) -> float:
+    vec_q, norm_q = build_query_vector(question)
+    vec_d = SITE["doc_vecs"].get(sec_id, {})
+    norm_d = SITE["doc_norms"].get(sec_id, 1.0)
+    base = cosine_sim(vec_q, norm_q, vec_d, norm_d)
 
-    # Alias boost: if question mentions a typical word for this section, bump lexical
-    for sec_id, alias_words in SECTION_ALIASES.items():
-        if section["id"] == sec_id and q_keywords & alias_words:
-            lex += 1.5
-            break
-
-    if TOKENIZER is None or MODEL is None:
-        return lex
-
-    # Semantic similarity using tiny BERT
-    section_for_model = " ".join(section["sentences"][:4]) or section["text"]
-    section_for_model = section_for_model[:512]
-
-    try:
-        q_vec = encode_text(question, TOKENIZER, MODEL)
-        s_vec = encode_text(section_for_model, TOKENIZER, MODEL)
-        sem = cosine_similarity(q_vec, s_vec)  # in [-1, 1]
-        # Map to roughly 0–2 and combine with lexical
-        sem = max(sem, 0.0) * 2.0
-    except Exception:
-        sem = 0.0
-
-    return lex * 0.7 + sem * 1.3
+    # small alias boost (e.g., word "projects" used when asking)
+    q_tokens = set(tokenize(question))
+    aliases = SECTION_ALIASES.get(sec_id, set())
+    if q_tokens & aliases:
+        base += 0.2
+    return base
 
 
 def find_best_sections(question: str, top_k: int = 2):
     if not SITE["sections"]:
         return []
-
     scored = []
-    for sec in SITE["sections"].values():
-        s = score_section(question, sec)
+    for sec_id, sec in SITE["sections"].items():
+        s = score_section(question, sec_id, sec)
         if s > 0:
             scored.append((s, sec))
-
     if not scored:
         return []
-
     scored.sort(key=lambda x: x[0], reverse=True)
     return [sec for _, sec in scored[:top_k]]
 
 
 def build_answer_from_sections(question: str):
-    # If no site loaded, short message
     if not SITE["sections"]:
         return (
             "I’m supposed to answer using the content of this website, "
@@ -289,32 +262,34 @@ def build_answer_from_sections(question: str):
             "You might want to refresh or contact the site owner."
         )
 
-    best_sections = find_best_sections(question, top_k=2)
-
-    if not best_sections:
+    best_secs = find_best_sections(question, top_k=2)
+    if not best_secs:
         return (
             "I’m designed to answer questions about this portfolio site only. "
             "I couldn’t find anything on this page related to that question."
         )
 
-    # Build a concise answer from 1–2 sections
     parts = []
-    for sec in best_sections:
-        text = " ".join(sec["sentences"][:4])
-        # Limit length
+    for sec in best_secs:
+        sentences = sec["sentences"] or [sec["text"]]
+        text = " ".join(sentences[:4])
         text = textwrap.shorten(text, width=420, placeholder="…")
-        if sec["id"] == "about":
+        sid = sec["id"]
+
+        if sid == "about":
             prefix = "From the About section: "
-        elif sec["id"] == "projects":
+        elif sid == "projects":
             prefix = "From the Projects & Experience section: "
-        elif sec["id"] == "skills":
+        elif sid == "skills":
             prefix = "From the Skills & Tools section: "
-        elif sec["id"] == "education":
+        elif sid == "education":
             prefix = "From the Education section: "
-        elif sec["id"] == "contact":
+        elif sid == "contact":
             prefix = "From the Contact section: "
-        elif sec["id"] == "interactive-apps":
+        elif sid == "interactive-apps":
             prefix = "From the Interactive Apps section: "
+        elif sid == "hero":
+            prefix = "From the top hero section: "
         else:
             prefix = f"From the {sec['heading']} section: "
 
@@ -322,12 +297,11 @@ def build_answer_from_sections(question: str):
 
     if len(parts) == 1:
         return parts[0]
-    else:
-        return parts[0] + "\n\nAlso, " + parts[1]
+    return parts[0] + "\n\nAlso, " + parts[1]
 
 
 def generate_asha_reply(user_text: str) -> str:
-    """Top-level reply generator using a tiny model for retrieval."""
+    """Top-level reply generator using our TF-IDF retrieval model."""
     if not user_text or not user_text.strip():
         return "You can ask me about Kanishq’s skills, projects, education, or how to contact him 😊"
 
@@ -344,7 +318,7 @@ def generate_asha_reply(user_text: str) -> str:
             "projects, skills, education, and contact details — all based on the page content."
         )
 
-    # Otherwise, answer from website content using model-powered retrieval
+    # Otherwise, answer from website content using our TF-IDF model
     return build_answer_from_sections(user_text)
 
 
@@ -374,15 +348,10 @@ if SITE["path"]:
 else:
     st.sidebar.error("index.html could not be found on the server.")
 
-if TOKENIZER is not None and MODEL is not None:
-    st.sidebar.write(f"Model: `{MODEL_NAME}` (tiny encoder for retrieval)")
-else:
-    st.sidebar.write("Model: unavailable, using lexical matching only.")
-
 # Memory usage (for reassurance)
 proc = psutil.Process(os.getpid())
 mem_used = proc.memory_info().rss / (1024 ** 2)
-st.sidebar.write(f"Approx. memory in use: {mem_used:.1f} MB (limit ~500MB)")
+st.sidebar.write(f"Approx. memory in use: {mem_used:.1f} MB (limit ~500MB, no heavy ML libs)")
 
 # User input
 user_input = st.chat_input("Ask something about this portfolio…")
@@ -392,13 +361,13 @@ if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
     st.chat_message("user").write(user_input)
 
-    # Generate reply (model-assisted retrieval)
+    # Generate reply with our TF-IDF model
     reply = generate_asha_reply(user_input)
 
     # Add assistant reply
     st.session_state.messages.append({"role": "assistant", "content": reply})
     st.chat_message("assistant").write(reply)
 
-    # Optionally trim very long histories
+    # Trim long histories just in case
     if len(st.session_state.messages) > 40:
         st.session_state.messages = st.session_state.messages[-40:]
