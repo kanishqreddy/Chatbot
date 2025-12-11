@@ -4,9 +4,9 @@ import textwrap
 import math
 from collections import Counter
 import html as html_lib
+import time  # for small reply delay
 
 import streamlit as st
-import psutil
 import requests
 
 # ---------------------------
@@ -782,22 +782,6 @@ st.caption("Ask questions about this portfolio and I’ll answer using only what
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# Sidebar: status + live RAM stats
-with st.sidebar:
-    if not SITE["sections"]:
-        st.error("I’m having trouble loading the page content right now.")
-        if SITE.get("debug"):
-            with st.expander("Debug info (developer only)"):
-
-                for line in SITE["debug"]:
-                    st.write(f"- {line}")
-    else:
-        st.markdown("**Asha is online and ready to chat.**")
-
-    proc = psutil.Process(os.getpid())
-    mem_used = proc.memory_info().rss / (1024 ** 2)
-    st.write(f"Approx. memory in use: **{mem_used:.1f} MB**")
-
 # ---------------------------
 # Suggestion buttons + chat input
 # ---------------------------
@@ -841,9 +825,15 @@ if user_input:
     # Generate reply with our TF-IDF model
     reply = generate_asha_reply(user_input)
 
-    # Add assistant reply
+    # Store assistant reply in history
     st.session_state.messages.append({"role": "assistant", "content": reply})
-    st.chat_message("assistant").write(reply)
+
+    # Simulate a small "thinking" delay before showing the reply
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        placeholder.write("...")
+        time.sleep(0.8)  # tweak duration if you want faster/slower
+        placeholder.write(reply)
 
     # Trim long histories just in case
     if len(st.session_state.messages) > 40:
