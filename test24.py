@@ -372,6 +372,13 @@ def build_answer_from_sections(question: str) -> str:
             "I couldn’t find anything related to that in the page content."
         )
 
+    # Avoid adding hero as a noisy second section
+    if len(best_secs) > 1 and best_secs[0]["id"] != "hero":
+        filtered = [best_secs[0]] + [
+            sec for sec in best_secs[1:] if sec["id"] != "hero"
+        ]
+        best_secs = filtered[:2]
+
     # Remember which sections we used, so we can expand later
     try:
         st.session_state["last_sections"] = [sec["id"] for sec in best_secs]
@@ -476,7 +483,7 @@ def build_expand_answer() -> str:
     return "\n\n".join(blocks)
 
 # ---------------------------
-# Phrase matching helper (fixes "hi" inside "his")
+# Phrase matching helper
 # ---------------------------
 
 def contains_any_phrase(text: str, phrases) -> bool:
@@ -601,7 +608,7 @@ st.caption("Ask questions about this portfolio and I’ll answer using only what
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# Sidebar: simple status + live RAM stats
+# Sidebar: status + live RAM stats
 with st.sidebar:
     if not SITE["sections"]:
         st.error("I’m having trouble loading the page content right now.")
@@ -617,10 +624,10 @@ with st.sidebar:
     st.write(f"Approx. memory in use: **{mem_used:.1f} MB**")
 
 # ---------------------------
-# Suggestion buttons (always visible)
+# Suggestion buttons + chat input
 # ---------------------------
 
-user_input = None  # will be set by a button or the chat box
+suggestion_clicked = None
 
 suggestions = [
     "Give me an overview",
@@ -635,11 +642,17 @@ st.markdown("##### Not sure what to ask? Try one of these:")
 cols = st.columns(len(suggestions))
 for col, text in zip(cols, suggestions):
     if col.button(text, use_container_width=True):
-        user_input = text
+        suggestion_clicked = text
 
-# If no suggestion button was clicked, fall back to the chat input
-if user_input is None:
-    user_input = st.chat_input("Ask something about this portfolio…")
+# Chat input is ALWAYS rendered, even when a button is clicked
+typed = st.chat_input("Ask something about this portfolio…")
+
+if typed:
+    user_input = typed
+elif suggestion_clicked is not None:
+    user_input = suggestion_clicked
+else:
+    user_input = None
 
 # ---------------------------
 # Handle user input (typed or clicked)
