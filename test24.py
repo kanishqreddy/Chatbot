@@ -3,6 +3,7 @@ import os
 import textwrap
 import math
 from collections import Counter
+import html as html_lib
 
 import streamlit as st
 import psutil
@@ -40,7 +41,7 @@ SITE_URL = os.environ.get("PORTFOLIO_URL", DEFAULT_SITE_URL)
 # ---------------------------
 
 def clean_html_text(html: str) -> str:
-    """Strip tags and script/style from HTML and normalise whitespace."""
+    """Strip tags, decode entities, normalise whitespace."""
     if not html:
         return ""
     html = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
@@ -56,8 +57,8 @@ def clean_html_text(html: str) -> str:
         html,
         flags=re.DOTALL | re.IGNORECASE,
     )
-    html = re.sub(r"<[^>]+>", " ", html)  # strip remaining tags
-    html = re.sub(r"&nbsp;?", " ", html, flags=re.IGNORECASE)
+    html = re.sub(r"<[^>]+>", " ", html)
+    html = html_lib.unescape(html)
     html = re.sub(r"\s+", " ", html)
     return html.strip()
 
@@ -125,7 +126,7 @@ def load_site_knowledge():
 
     # Extract <section id="..."> blocks
     section_pattern = re.compile(
-        r'<section\s+[^>]*id="([^"]+)"[^>]*>(.*?)</section>',
+        r'<section[^>]*id="([^"]+)"[^>]*>(.*?)</section>',
         re.DOTALL | re.IGNORECASE,
     )
     sections = {}
@@ -145,6 +146,7 @@ def load_site_knowledge():
         sections[sec_id] = {
             "id": sec_id,
             "heading": heading,
+            "html": sec_html,      # keep raw HTML for nicer summaries
             "text": clean_text,
             "sentences": sentences,
         }
@@ -266,7 +268,7 @@ def find_best_sections(question: str, top_k: int = 2):
     return [sec for _, sec in scored[:top_k]]
 
 # ---------------------------
-# Section summarisation helpers
+# Section kind + smart summaries
 # ---------------------------
 
 def section_kind(sec_id: str, heading: str) -> str:
@@ -289,18 +291,191 @@ def section_kind(sec_id: str, heading: str) -> str:
     return "other"
 
 
-def summarize_section_text(sec: dict, max_chars: int = 260) -> str:
-    sentences = sec.get("sentences") or [sec.get("text", "")]
-    text = " ".join(sentences[:3])
-    return textwrap.shorten(text, width=max_chars, placeholder="…")
+def summarize_skills_section(sec, max_chars=360):
+    text = sec.get("text", "")
+    parts = []
 
+    m_lang = re.search(r"Languages (.*?) Tools & Platforms", text)
+    m_tools = re.search(r"Tools & Platforms (.*?) Areas of Expertise", text)
+    m_areas = re.search(r"Areas of Expertise (.*?) Certifications", text)
+    m_certs = re.search(r"Certifications (.*)$", text)
+
+    if m_lang:
+        langs = m_lang.group(1).strip()
+        parts.append(f"He works with languages like {langs}.")
+    if m_tools:
+        tools = m_tools.group(1).strip()
+        parts.append(f"He uses tools and platforms such as {tools}.")
+    if m_areas:
+        areas = m_areas.group(1).strip()
+        parts.append(f"His main areas of expertise include {areas}.")
+    if m_certs:
+        certs_text = m_certs.group(1).strip()
+        certs_phrases = [c.strip() for c in re.split(r"\.\s+", certs_text) if c.strip()]
+        if certs_phrases:
+            listed = "; ".join(certs_phrases[:2])
+            parts.append(f"He also holds certifications such as {listed}.")
+
+    if not parts:
+        sents = sec.get("sentences") or [text]
+        text = " ".join(sents[:3])
+        return textwrap.shorten(text, max_chars, placeholder="…")
+
+    summary = " ".join(parts)
+    return textwrap.shorten(summary, max_chars, placeholder="…")
+
+
+def summarize_projects_section(sec, max_chars=420):
+    html_proj = sec.get("html", "")
+    cards = html_proj.split('<div class="card">')[1:]
+    snippets = []
+
+    for card in cards:
+        card_html = card.split('<div class="card">')[0]
+        title_m = re.search(r"<h3>(.*?)</h3>", card_html, re.DOTALL)
+        small_m = re.search(r"<small>(.*?)</small>", card_html, re.DOTALL)
+        p_m = re.search(r"<p[^>]*>(.*?)</p>", card_html, re.DOTALL)
+
+        if not title_m:
+            continue
+
+        title = html_lib.unescape(re.sub(r"\s+", " ", title_m.group(1)).strip())
+        company = years = None
+        if small_m:
+            small_txt = html_lib.unescape(re.sub(r"\s+", " ", small_m.group(1)).strip())
+            if "•" in small_txt:
+                company, years = [s.strip() for s in small_txt.split("•", 1)]
+            else:
+                company = small_txt
+
+        desc = ""
+        if p_m:
+            desc = html_lib.unescape(re.sub(r"\s+", " ", p_m.group(1)).strip())
+
+        sentence = title
+        if company:
+            sentence += f" at {company}"
+        if years:
+            sentence += f" ({years})"
+        if desc:
+            sentence += f": {desc}"
+        snippets.append(sentence)
+
+    if not snippets:
+        sents = sec.get("sentences") or [sec.get("text", "")]
+        return textwrap.shorten(" ".join(sents[:3]), max_chars, placeholder="…")
+
+    summary = " ".join(snippets[:3])  # first 3 projects only
+    return textwrap.shorten(summary, max_chars, placeholder="…")
+
+
+def summarize_education_section(sec, max_chars=260):
+    text = sec.get("text", "")
+    m1 = re.search(r"(Master of Business Analytics .*?Australia)", text)
+    m2 = re.search(r"(Bachelor of Data Science .*?Australia)", text)
+
+    parts = []
+    if m1:
+        parts.append(m1.group(1).strip())
+    if m2:
+        parts.append(m2.group(1).strip())
+
+    if parts:
+        if len(parts) == 2:
+            sent = f"He completed a {parts[0]} and a {parts[1]}."
+        else:
+            sent = f"He completed a {parts[0]}."
+        return textwrap.shorten(sent, max_chars, placeholder="…")
+
+    sents = sec.get("sentences") or [text]
+    return textwrap.shorten(" ".join(sents[:2]), max_chars, placeholder="…")
+
+
+def summarize_contact_section(sec, max_chars=260):
+    text = sec.get("text", "")
+    m_open = re.search(r"Open to (.*?)\.", text)
+    m_email = re.search(r"Email\s+([^\s]+@[^\s]+)", text)
+
+    parts = []
+    if m_open:
+        parts.append("He is open to " + m_open.group(1).strip() + ".")
+    if m_email:
+        parts.append("You can contact him at " + m_email.group(1).strip() + ".")
+
+    if not parts:
+        sents = sec.get("sentences") or [text]
+        return textwrap.shorten(" ".join(sents[:2]), max_chars, placeholder="…")
+
+    return textwrap.shorten(" ".join(parts), max_chars, placeholder="…")
+
+
+def summarize_about_section(sec, max_chars=320):
+    sents = sec.get("sentences") or [sec.get("text", "")]
+    if sents and "about me" in sents[0].lower():
+        sents = sents[1:]
+    if not sents:
+        return ""
+    text = " ".join(sents[:3])
+    return textwrap.shorten(text, max_chars, placeholder="…")
+
+
+def summarize_hero_section(sec, max_chars=260):
+    sents = sec.get("sentences") or [sec.get("text", "")]
+    if not sents:
+        return ""
+    s0 = sents[0]
+    if "Hi, I'm" in s0:
+        s0 = s0[s0.index("Hi, I'm"):]
+    rest = sents[1:2]  # avoid button labels / tags
+    text = " ".join([s0] + rest)
+    return textwrap.shorten(text, max_chars, placeholder="…")
+
+
+def summarize_generic_section(sec, max_chars=260):
+    sents = sec.get("sentences") or [sec.get("text", "")]
+    heading = sec.get("heading", "").lower()
+
+    clean_sents = []
+    for i, s in enumerate(sents):
+        sl = s.lower()
+        # drop short first sentence that just repeats the heading
+        if i == 0 and heading and heading in sl and len(sl.split()) <= len(heading.split()) + 6:
+            continue
+        clean_sents.append(s)
+
+    if not clean_sents:
+        clean_sents = sents
+
+    text = " ".join(clean_sents[:3])
+    return textwrap.shorten(text, max_chars, placeholder="…")
+
+
+def summarize_section_text(sec: dict, kind: str, max_chars: int = 260) -> str:
+    """Dispatch to the right summariser for each section type."""
+    if kind == "skills":
+        return summarize_skills_section(sec, max_chars=360)
+    if kind == "projects":
+        return summarize_projects_section(sec, max_chars=420)
+    if kind == "education":
+        return summarize_education_section(sec, max_chars=max_chars)
+    if kind == "contact":
+        return summarize_contact_section(sec, max_chars=max_chars)
+    if kind == "about":
+        return summarize_about_section(sec, max_chars=320)
+    if kind == "hero":
+        return summarize_hero_section(sec, max_chars=max_chars)
+    return summarize_generic_section(sec, max_chars=max_chars)
+
+# ---------------------------
+# Answer builders
+# ---------------------------
 
 def build_section_answer(sec: dict, primary: bool) -> str:
-    """Generate a short, explanation-style answer for one section."""
+    """Generate a natural, explanation-style answer for one section."""
     sid = sec["id"]
     heading = sec["heading"]
     kind = section_kind(sid, heading)
-    summary = summarize_section_text(sec)
+    summary = summarize_section_text(sec, kind)
 
     if kind == "skills":
         prefix = (
@@ -354,11 +529,9 @@ def build_section_answer(sec: dict, primary: bool) -> str:
     tail = "\n\nIf you’d like more detail on this, just ask me to expand on it 🙂"
     return prefix + summary + (tail if primary else "")
 
-# ---------------------------
-# Answer builders
-# ---------------------------
 
 def build_answer_from_sections(question: str) -> str:
+    """Main retrieval-based answer from page sections."""
     if not SITE["sections"]:
         return (
             "I’m supposed to answer using the content of this portfolio, "
@@ -394,7 +567,7 @@ def build_answer_from_sections(question: str) -> str:
 
 
 def build_overview_answer() -> str:
-    """Give a high-level summary of the whole portfolio page."""
+    """High-level overview of the whole portfolio page."""
     if not SITE["sections"]:
         return (
             "I’m supposed to answer using the content of this portfolio, "
@@ -408,7 +581,8 @@ def build_overview_answer() -> str:
         sec = SITE["sections"].get(sec_id)
         if not sec:
             return
-        short = summarize_section_text(sec, max_chars=260)
+        kind = section_kind(sec_id, sec["heading"])
+        short = summarize_section_text(sec, kind, max_chars=260)
         parts.append(f"{label}: {short}")
 
     add_sec("hero", "At a glance")
@@ -614,6 +788,7 @@ with st.sidebar:
         st.error("I’m having trouble loading the page content right now.")
         if SITE.get("debug"):
             with st.expander("Debug info (developer only)"):
+
                 for line in SITE["debug"]:
                     st.write(f"- {line}")
     else:
